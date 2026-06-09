@@ -1,0 +1,437 @@
+// =====================================================================
+//  Prisma şeması — İnşaat Proje Finansal Yönetim Uygulaması
+//  CLAUDE.md'deki finansal kurallara birebir uyar.
+//
+//  KURALLAR:
+//  - Tüm para alanları Decimal (ASLA Float). Tüm tutarlar KDV mantığıyla.
+//  - Hesaplanan değerler SAKLANMAZ: net tahsilat, kâr, marj, sapma, icmal,
+//    kalan ödeme → finans katmanında / sorguda üretilir.
+//  - Multi-tenant: her tenant tablosu workspaceId taşır; izolasyon Prisma
+//    Client Extension ile zorlanır (hiçbir sorgu workspaceId'siz veri dönmez).
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------- Enums --------------------------------
+
+enum Role {
+  OWNER         // her şeyi görür/yönetir
+  ACCOUNTING    // finansal
+  SITE_MANAGER  // yalnız metraj/ilerleme girer
+}
+
+enum ProjectStatus {
+  PLANNING
+  ACTIVE
+  ON_HOLD
+  COMPLETED
+}
+
+enum PriceType {
+  LABOR     // işçilik
+  MATERIAL  // malzeme
+  IDARE     // idare
+}
+
+enum PaymentSide {
+  EXPENSE // gider (taşerona ödeme)
+  INCOME  // gelir (idareden tahsilat)
+}
+
+enum PaymentMethod {
+  CASH    // nakit
+  CHEQUE  // çek (vadeli)
+}
+
+enum DeductionType {
+  TEVKIFAT
+  STOPAJ
+  DAMGA
+  BARTER
+  OTHER
+}
+
+enum ChequeDirection {
+  ISSUED   // verilen (taşerona)
+  RECEIVED // alınan (idareden)
+}
+
+enum ChequeStatus {
+  PENDING  // beklemede
+  CLEARED  // tahsil edildi
+  BOUNCED  // karşılıksız
+}
+
+enum HakedisStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  PAID
+}
+
+// ------------------- Auth (Auth.js v5 / NextAuth) -------------------
+// Credentials + JWT kullanıyorsan Account/Session/VerificationToken atılabilir.
+
+model User {
+  id            String       @id @default(cuid())
+  email         String       @unique
+  name          String?
+  passwordHash  String?      // Credentials provider için
+  emailVerified DateTime?
+  image         String?
+  memberships   Membership[]
+  accounts      Account[]
+  sessions      Session[]
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ----------------------------- Tenant -------------------------------
+
+model Workspace {
+  id             String          @id @default(cuid())
+  name           String
+  slug           String          @unique
+  memberships    Membership[]
+  projects       Project[]
+  workItems      WorkItem[]
+  priceRevisions PriceRevision[]
+  paymentTerms   PaymentTerm[]
+  subcontractors Subcontractor[]
+  contracts      Contract[]
+  deductions     Deduction[]
+  payments       Payment[]
+  hakedisler     Hakedis[]
+  collections    Collection[]
+  cheques        Cheque[]
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+}
+
+model Membership {
+  id          String    @id @default(cuid())
+  workspaceId String
+  userId      String
+  role        Role      @default(SITE_MANAGER)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt   DateTime  @default(now())
+
+  @@unique([workspaceId, userId])
+  @@index([workspaceId])
+}
+
+// ----------------------------- Proje --------------------------------
+
+model Project {
+  id                   String          @id @default(cuid())
+  workspaceId          String
+  name                 String
+  code                 String?
+  address              String?
+  city                 String?
+  district             String?
+  startDate            DateTime?       @db.Date
+  endDate              DateTime?       @db.Date
+  status               ProjectStatus   @default(PLANNING)
+  // marj bu eşiğin altına düşerse sapma analizi uyarı verir (default %10)
+  marginAlertThreshold Decimal         @default(0.10) @db.Decimal(6, 5)
+  workspace            Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  workItems            WorkItem[]
+  subcontractors       Subcontractor[]
+  contracts            Contract[]
+  hakedisler           Hakedis[]
+  cheques              Cheque[]
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+
+  @@index([workspaceId])
+}
+
+// --------------------------- İş Kalemi ------------------------------
+// HESAPLANAN (saklanmaz, finans katmanında — revizyonlar tarihe göre uygulanır):
+//   base            = quantity × (laborUnitPrice + materialUnitPrice)
+//   costTotalInclVat = base × (1 + costVatRate)
+//   idareBase       = quantity × idareUnitPrice
+//   idareGross      = idareBase × (1 + idareVatRate)
+//   idareNet        = idareGross
+//                     − (idareBase × idareVatRate × tevkifatRate)
+//                     − (idareBase × stopajRate)
+//                     − (idareBase × damgaRate)
+//   profit          = idareNet − costTotalInclVat
+//   margin          = profit / idareNet
+
+model WorkItem {
+  id          String @id @default(cuid())
+  workspaceId String
+  projectId   String
+  name        String
+  order       Int    @default(0)
+  unit        String // m³, m², adet...
+  quantity    Decimal @db.Decimal(18, 4) // metraj
+
+  // Program / takvim — plan baseline'ı sabittir; revize ayrı tutulur.
+  // Planlanan maliyet YALNIZ plan tarihlerine bağlanır, asla revize tarihe.
+  planStart   DateTime  @db.Date
+  planEnd     DateTime  @db.Date
+  reviseStart DateTime? @db.Date
+  reviseEnd   DateTime? @db.Date
+
+  // Maliyet birim fiyatları (KDV'siz). Revizyonlar PriceRevision'da.
+  laborUnitPrice    Decimal @default(0) @db.Decimal(18, 4) // işçilik B.F
+  materialUnitPrice Decimal @default(0) @db.Decimal(18, 4) // malzeme B.F
+  costVatRate       Decimal @default(0.20) @db.Decimal(6, 5)
+
+  // İdare gelir tarafı (KDV'siz birim fiyat + kesinti oranları, kalem bazında)
+  idareUnitPrice Decimal @default(0) @db.Decimal(18, 4)
+  idareVatRate   Decimal @default(0.20) @db.Decimal(6, 5)
+  tevkifatRate   Decimal @default(0.40) @db.Decimal(6, 5)    // 4/10
+  stopajRate     Decimal @default(0.05) @db.Decimal(6, 5)    // yıllara sari; yoksa 0
+  damgaRate      Decimal @default(0.00948) @db.Decimal(6, 5) // binde 9,48
+
+  workspace      Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project        Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  priceRevisions PriceRevision[]
+  paymentTerms   PaymentTerm[]
+  contracts      Contract[]
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@index([workspaceId])
+  @@index([projectId])
+}
+
+// Birim fiyat revizyonu (gün bazlı fiyat geçişi).
+// Plan fiyatları WorkItem'da; revizyon effectiveDate'ten itibaren geçerlidir.
+model PriceRevision {
+  id            String    @id @default(cuid())
+  workspaceId   String
+  workItemId    String
+  type          PriceType // LABOR | MATERIAL | IDARE
+  effectiveDate DateTime  @db.Date
+  unitPrice     Decimal   @db.Decimal(18, 4)
+  workspace     Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  workItem      WorkItem  @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+  createdAt     DateTime  @default(now())
+
+  @@index([workspaceId])
+  @@index([workItemId, type, effectiveDate])
+}
+
+// Yüzdeler — ödeme/tahsilat vade dağılımı.
+// Kademeler: 0(peşin), 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180.
+// Yarım kademeler (45/75/105/135/165) finans katmanında bir önceki tam
+// kademenin ayına yuvarlanır — burada ham gün saklanır.
+// EXPENSE: costType = LABOR|MATERIAL. INCOME (idare tahsilatı): costType null, genelde peşin.
+// Bir (workItem, side, costType) için ratio toplamı 1.0 olmalı (Zod ile doğrula).
+model PaymentTerm {
+  id           String        @id @default(cuid())
+  workspaceId  String
+  workItemId   String
+  side         PaymentSide
+  costType     PriceType?
+  maturityDays Int           // 0 = peşin
+  method       PaymentMethod @default(CASH)
+  ratio        Decimal       @db.Decimal(6, 5) // 0..1
+  workspace    Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  workItem     WorkItem      @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
+  @@index([workItemId, side])
+}
+
+// --------------------- Taşeron / Gerçekleşen Gider ------------------
+
+model Subcontractor {
+  id          String     @id @default(cuid())
+  workspaceId String
+  projectId   String?
+  name        String
+  taxNumber   String?
+  phone       String?
+  email       String?
+  workspace   Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project     Project?   @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  contracts   Contract[]
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  @@index([workspaceId])
+}
+
+// Taşeron/firma sözleşmesi (gerçekleşen gider).
+// gross    = baseAmount × (1 + vatRate)
+// kalanÖdeme = gross − Σ(payments)   ← bilgi amaçlı deductions'tan BAĞIMSIZ
+model Contract {
+  id              String        @id @default(cuid())
+  workspaceId     String
+  projectId       String
+  subcontractorId String
+  workItemId      String?
+  title           String
+  baseAmount      Decimal       @db.Decimal(18, 4) // KDV'siz sözleşme bedeli
+  vatRate         Decimal       @default(0.20) @db.Decimal(6, 5)
+  workspace       Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project         Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  subcontractor   Subcontractor @relation(fields: [subcontractorId], references: [id], onDelete: Restrict)
+  workItem        WorkItem?     @relation(fields: [workItemId], references: [id], onDelete: SetNull)
+  deductions      Deduction[]
+  payments        Payment[]
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([workspaceId])
+  @@index([projectId])
+}
+
+// Bilgi amaçlı kesintiler (barter dahil). "Kesintiler Sonrası Kalan" bundan
+// hesaplanır; "Kalan Ödeme" bundan bağımsızdır (gross − ödemeler).
+model Deduction {
+  id          String        @id @default(cuid())
+  workspaceId String
+  contractId  String
+  type        DeductionType
+  label       String?
+  amount      Decimal       @db.Decimal(18, 4)
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  contract    Contract      @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  createdAt   DateTime      @default(now())
+
+  @@index([workspaceId])
+  @@index([contractId])
+}
+
+// Gerçekleşen giden ödeme (taşerona). Çek ise chequeId ile bağlanır.
+model Payment {
+  id          String        @id @default(cuid())
+  workspaceId String
+  contractId  String
+  date        DateTime      @db.Date
+  amount      Decimal       @db.Decimal(18, 4)
+  method      PaymentMethod
+  chequeId    String?
+  note        String?
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  contract    Contract      @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  cheque      Cheque?       @relation(fields: [chequeId], references: [id], onDelete: SetNull)
+  createdAt   DateTime      @default(now())
+
+  @@index([workspaceId])
+  @@index([contractId])
+}
+
+// ----------------------- İdare Hakediş / Gelir ----------------------
+// base = baseAmount (KDV'siz)
+// gross = base × (1 + vatRate)
+// net   = gross − (base × vatRate × tevkifatRate) − (base × stopajRate) − (base × damgaRate)
+
+model Hakedis {
+  id           String        @id @default(cuid())
+  workspaceId  String
+  projectId    String
+  periodYear   Int
+  periodMonth  Int           // 1..12
+  description  String?
+  baseAmount   Decimal       @db.Decimal(18, 4) // KDV'siz hakediş tutarı
+  vatRate      Decimal       @default(0.20) @db.Decimal(6, 5)
+  tevkifatRate Decimal       @default(0.40) @db.Decimal(6, 5)
+  stopajRate   Decimal       @default(0.05) @db.Decimal(6, 5)
+  damgaRate    Decimal       @default(0.00948) @db.Decimal(6, 5)
+  status       HakedisStatus @default(DRAFT)
+  workspace    Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project      Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  collections  Collection[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([workspaceId])
+  @@index([projectId, periodYear, periodMonth])
+}
+
+// Gerçekleşen gelen tahsilat (idareden). Çek ise chequeId ile bağlanır.
+model Collection {
+  id          String        @id @default(cuid())
+  workspaceId String
+  hakedisId   String
+  date        DateTime      @db.Date
+  amount      Decimal       @db.Decimal(18, 4)
+  method      PaymentMethod
+  chequeId    String?
+  note        String?
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  hakedis     Hakedis       @relation(fields: [hakedisId], references: [id], onDelete: Cascade)
+  cheque      Cheque?       @relation(fields: [chequeId], references: [id], onDelete: SetNull)
+  createdAt   DateTime      @default(now())
+
+  @@index([workspaceId])
+  @@index([hakedisId])
+}
+
+// --------------------------- Çek Yönetimi ---------------------------
+// ISSUED = verilen (taşerona), RECEIVED = alınan (idareden).
+// dueDate üzerinden hatırlatma (Faz 2).
+
+model Cheque {
+  id           String          @id @default(cuid())
+  workspaceId  String
+  projectId    String?
+  direction    ChequeDirection
+  counterparty String          // kime / kimden
+  amount       Decimal         @db.Decimal(18, 4)
+  dueDate      DateTime        @db.Date
+  status       ChequeStatus    @default(PENDING)
+  bankName     String?
+  chequeNo     String?
+  note         String?
+  workspace    Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  project      Project?        @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  payments     Payment[]
+  collections  Collection[]
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  @@index([workspaceId])
+  @@index([dueDate])
+  @@index([status])
+}
