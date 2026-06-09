@@ -11,7 +11,7 @@ Bu dosya Claude Code için projenin ana rehberidir. Her oturumda önce bunu oku.
 
 - Dil **Türkçe**. Doğrudan, kısa, kararlı ol. Seçenek menüsü sunma — öner ve uygula.
 - Küçük, atomik commit'ler. Her görev tek bir işe odaklı.
-- **Commit atarsın ama ASLA push etmezsin.** Push, Burak'ın sorumluluğu.
+- Küçük, atomik commit'ler at; çalışan branch'e push edebilirsin (Burak onayladı).
 - Lint/format **Biome** ile — ESLint/Prettier kurma.
 - Yanlış bir hücre/formül mantığı = yanlış hakediş. Finansal hesaplarda spec'e birebir uy; emin değilsen sor.
 
